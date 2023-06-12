@@ -1,0 +1,320 @@
+import * as React from 'react';
+import type { ITokenBalance } from '~/queries/useTokenBalances';
+import { SelectToken, SubmitButton } from '~/components/Form';
+import { BeatLoader } from '~/components/BeatLoader';
+import { useAddressStore } from '~/store/address';
+import { useForm, useFieldArray, Controller } from 'react-hook-form';
+import useBatchCalls from '~/queries/useBatchCalls';
+import { LlamaContractInterface } from '~/utils/contract';
+import BigNumber from 'bignumber.js';
+import { secondsByDuration } from '~/utils/constants';
+import useStreamToken from '~/queries/useStreamToken';
+import { useTranslations } from 'next-intl';
+import useGnosisBatch from '~/queries/useGnosisBatch';
+import { ExclamationCircleIcon } from '@heroicons/react/24/outline';
+import toast from 'react-hot-toast';
+import { resolveEnsAndRave } from '~/utils/address';
+import { ExclamationTriangleIcon } from '@heroicons/react/24/solid';
+import { useBalances } from '~/hooks';
+
+type FormValues = {
+  streams: {
+    addressToStream: string;
+    shortName: string;
+    tokenAddress: string;
+    amountToStream: string;
+    streamDuration: 'month' | 'year' | 'week';
+  }[];
+};
+
+interface ICall {
+  [key: string]: string[];
+}
+
+const CreateMultipleStreams = ({ tokens }: { tokens: ITokenBalance[] }) => {
+  const updateAddress = useAddressStore((state) => state.updateAddress);
+
+  const tokenOptions = tokens.map((t) => t.tokenAddress);
+  const { balances } = useBalances();
+  const tokensInDebt = balances?.filter(
+    (x: any) => 0 > x.amount - (Date.now() / 1e3 - x.lastPayerUpdate) * (x.totalPaidPerSec / 10 ** 20)
+  );
+  const { mutate: batchCall, isLoading: batchLoading } = useBatchCalls();
+  const { mutate: streamToken, isLoading: createStreamLoading } = useStreamToken();
+  const { mutate: gnosisBatch, isLoading: gnosisLoading } = useGnosisBatch();
+
+  const t0 = useTranslations('Common');
+  const t1 = useTranslations('Forms');
+  const {
+    register,
+    control,
+    handleSubmit,
+    formState: { errors },
+  } = useForm<FormValues>({
+    defaultValues: {
+      streams: [
+        {
+          addressToStream: '',
+          shortName: '',
+          tokenAddress: tokens[0]?.tokenAddress ?? '',
+          amountToStream: '',
+          streamDuration: 'month',
+        },
+      ],
+    },
+    mode: 'onBlur',
+  });
+
+  const { fields, append, remove } = useFieldArray({
+    name: 'streams',
+    control,
+  });
+
+  const onSubmit = async (data: FormValues) => {
+    if (data.streams.length === 1 && process.env.NEXT_PUBLIC_SAFE === 'false') {
+      const item = data.streams[0];
+      if (item.shortName && item.shortName !== '') {
+        updateAddress(item.addressToStream?.toLowerCase(), item.shortName);
+      }
+
+      const duration = item.streamDuration;
+      const tokenDetails = tokens.find((t) => t.tokenAddress?.toString() === item.tokenAddress?.toString()) ?? null;
+
+      if (tokenDetails === null) return;
+
+      const amountPerSec = new BigNumber(item.amountToStream).times(1e20).div(secondsByDuration[duration]).toFixed(0);
+      const address = await resolveEnsAndRave(item.addressToStream);
+      if (!address) {
+        toast.error(`Invalid address: ${item.addressToStream}`);
+        return;
+      }
+
+      streamToken({
+        method: 'CREATE_STREAM',
+        llamaContractAddress: tokenDetails.llamaContractAddress,
+        payeeAddress: address,
+        amountPerSec,
+      });
+    } else {
+      const calls: ICall = {};
+
+      for (let i = 0; i < data.streams.length; i++) {
+        const item = data.streams[i];
+        if (item.shortName && item.shortName !== '') {
+          updateAddress(item.addressToStream?.toLowerCase(), item.shortName);
+        }
+
+        const duration = item.streamDuration;
+
+        const tokenDetails = tokens.find((t) => t.tokenAddress?.toString() === item.tokenAddress?.toString()) ?? null;
+        if (tokenDetails === null) return calls;
+        // format amount to bignumber
+        // convert amt to seconds
+        const amountPerSec = new BigNumber(item.amountToStream).times(1e20).div(secondsByDuration[duration]).toFixed(0);
+        const llamaContractAddress = tokenDetails.llamaContractAddress;
+
+        const address = await resolveEnsAndRave(item.addressToStream);
+        if (!address) {
+          toast.error(`Invalid address: ${item.addressToStream}`);
+          return;
+        }
+        const call = LlamaContractInterface.encodeFunctionData('createStream', [address, amountPerSec]);
+        if (!calls[llamaContractAddress]) {
+          calls[llamaContractAddress] = [];
+        }
+        calls[llamaContractAddress].push(call);
+      }
+
+      if (process.env.NEXT_PUBLIC_SAFE === 'true') {
+        gnosisBatch({ calls: calls });
+      } else {
+        Object.keys(calls).map((p) => {
+          batchCall({ llamaContractAddress: p, calls: calls[p] });
+        });
+      }
+    }
+  };
+
+  return (
+    <form className="flex flex-col gap-4" onSubmit={handleSubmit(onSubmit)}>
+      {tokensInDebt && tokensInDebt.length > 0 && (
+        <>
+          <span className="flex gap-1">
+            <ExclamationTriangleIcon className="h-6 w-6 text-red-600" />
+            <text className="text-md">{`No new streams can be created for:`}</text>
+            {tokensInDebt.map((x, i) => {
+              return (
+                <text key={i} className="text-md">
+                  {x.name}
+                </text>
+              );
+            })}
+          </span>
+          <text className="text-sm">
+            You won't be able to create or modify streams for these tokens while in debt, please either repay your debt
+            or cancel it by canceling the streams.
+          </text>
+        </>
+      )}
+      {fields.map((field, index) => {
+        return (
+          <section className="flex flex-col gap-4" key={field.id}>
+            {index > 0 && <hr className="mb-0 mt-2 border-dashed" />}
+
+            <label>
+              <span className="input-labe">{t1('addressToStream')}</span>
+              <input
+                placeholder={t1('recipientAddress')}
+                {...register(`streams.${index}.addressToStream` as const, {
+                  required: true,
+                })}
+                className="input-field"
+                autoComplete="off"
+                autoCorrect="off"
+                type="text"
+                spellCheck="false"
+              />
+              {errors?.streams?.[index]?.addressToStream?.type === 'required' && (
+                <p className="mt-1 text-xs text-red-500 dark:text-red-600">{t1('requiredField')}</p>
+              )}
+              {errors?.streams?.[index]?.addressToStream?.type === 'pattern' && (
+                <p className="mt-1 text-xs text-red-500 dark:text-red-600">{t1('validAddress')}</p>
+              )}
+            </label>
+
+            <label>
+              <span className="input-label">
+                <span className="mr-1">{t1('associateName')}</span>
+                <small className="text-neutral-500">{`(${t1('optional')})`}</small>
+              </span>
+              <input
+                placeholder={t1('fastIdentification')}
+                {...register(`streams.${index}.shortName` as const)}
+                className="input-field"
+                autoComplete="off"
+                autoCorrect="off"
+                type="text"
+                spellCheck="false"
+              />
+              <span className="mt-1 flex space-x-1">
+                <ExclamationCircleIcon className="h-4 w-4 flex-shrink-0 text-gray-500 dark:text-gray-400" />
+                <span className="text-[11px] text-gray-500 dark:text-gray-400">
+                  Names are only stored in the local storage of your device.
+                </span>
+              </span>
+            </label>
+
+            <span>
+              <Controller
+                name={`streams.${index}.tokenAddress`}
+                control={control}
+                rules={{ required: true }}
+                render={({ field }) => (
+                  <SelectToken
+                    handleTokenChange={field.onChange}
+                    tokens={tokenOptions}
+                    label={t1('selectTokenFromBalances')}
+                    tokenBalanceOf="lpContract"
+                    {...field}
+                  />
+                )}
+              />
+            </span>
+            <div>
+              <div>
+                <label htmlFor={`stream-amount-${index}`} className="input-label">
+                  {t1('amountToStream')}
+                </label>
+
+                <div className="relative flex">
+                  <input
+                    placeholder="0.0"
+                    {...register(`streams.${index}.amountToStream` as const, {
+                      required: true,
+                      pattern: /^[0-9]*[.,]?[0-9]*$/,
+                    })}
+                    className="input-field"
+                    autoComplete="off"
+                    autoCorrect="off"
+                    type="text"
+                    spellCheck="false"
+                    inputMode="decimal"
+                  />
+
+                  <label {...register(`streams.${index}.streamDuration` as const)} className="sr-only">
+                    {t1('streamDuration')}
+                  </label>
+                  <select
+                    {...register(`streams.${index}.streamDuration` as const, {
+                      required: true,
+                    })}
+                    className="order-lp-gray-1 absolute right-1 bottom-1 top-2 my-auto flex w-full max-w-[24%] items-center truncate rounded-[10px] p-2 pr-4 text-sm shadow-sm dark:border-lp-gray-2 dark:bg-lp-gray-5"
+                    style={{ backgroundSize: '1.25rem', backgroundPosition: 'calc(100% - 4px) 55%' }}
+                  >
+                    <option value="week">{t0('week')}</option>
+                    <option value="month">{t0('month')}</option>
+                    <option value="year">{t0('year')}</option>
+                  </select>
+                </div>
+                <span className="mt-1 flex space-x-1">
+                  <ExclamationCircleIcon className="h-4 w-4 flex-shrink-0 text-gray-500 dark:text-gray-400" />
+                  <span className="text-[11px] text-gray-500 dark:text-gray-400">
+                    Streams have an arbitrary duration and they can be cancelled at any time.
+                  </span>
+                </span>
+              </div>
+              {errors?.streams?.[index]?.amountToStream?.type === 'required' && (
+                <p className="mt-1 text-xs text-red-500 dark:text-red-600">{t1('requiredField')}</p>
+              )}
+              {errors?.streams?.[index]?.amountToStream?.type === 'pattern' && (
+                <p className="mt-1 text-xs text-red-500 dark:text-red-600">{t1('validNumber')}</p>
+              )}
+            </div>
+
+            <div>
+              <button
+                type="button"
+                className="w-fit rounded-[10px] border border-green-400 py-[6px] px-6 text-sm font-normal shadow-sm disabled:cursor-not-allowed disabled:opacity-50 dark:border-green-800"
+                style={{ marginRight: '0.6em' }}
+                disabled={false}
+                onClick={() =>
+                  append({
+                    addressToStream: '',
+                    shortName: '',
+                    tokenAddress: tokens[0]?.tokenAddress ?? '',
+                    amountToStream: '',
+                    streamDuration: 'month',
+                  })
+                }
+              >
+                Add another stream
+              </button>
+              {fields.length > 1 && (
+                <button
+                  type="button"
+                  className="w-fit rounded-[10px] border border-red-400 py-[6px] px-6 text-sm font-normal shadow-sm disabled:cursor-not-allowed disabled:opacity-50 dark:border-red-800"
+                  disabled={fields.length <= 1}
+                  onClick={() => remove(index)}
+                >
+                  Delete
+                </button>
+              )}
+            </div>
+          </section>
+        );
+      })}
+
+      <div className="mt-2 flex flex-col gap-3 sm:flex-row">
+        <SubmitButton className="flex-1" disabled={createStreamLoading || batchLoading || gnosisLoading}>
+          {createStreamLoading || batchLoading ? (
+            <BeatLoader size="6px" color="white" />
+          ) : (
+            'Create Stream' + (fields.length <= 1 ? '' : 's')
+          )}
+        </SubmitButton>
+      </div>
+    </form>
+  );
+};
+
+export default CreateMultipleStreams;

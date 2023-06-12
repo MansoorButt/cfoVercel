@@ -1,0 +1,14 @@
+import type { ITokenList } from '~/types';
+import fuji from './fuji';
+import goerli from './goerli';
+
+interface ILists {
+  [key: number]: ITokenList;
+}
+
+const tokenLists: ILists = {
+  43113: fuji,
+  5: goerli,
+};
+
+export default tokenLists;
